@@ -1,3 +1,4 @@
+using System.Net.Http;
 using Amazon;
 using Amazon.S3;
 using Cocona;
@@ -23,7 +24,8 @@ class Program
             [Option('p', Description = "Number of concurrent uploads")] int parallelism = 4,
             [Option("ignore-token", Description = "Ignore saved continuation token and restart scan from the beginning")] bool ignoreToken = false,
             [Option("db-path", Description = "Path to the SQLite database file")] string dbPath = "sync_state.db",
-            [Option("temp-dir", Description = "Directory for temporary files during large file transfers")] string? tempDir = null
+            [Option("temp-dir", Description = "Directory for temporary files during large file transfers")] string? tempDir = null,
+            [Option("skip-ssl", Description = "Skip SSL certificate validation for the MinIO connection")] bool skipSsl = false
         ) =>
         {
             Console.WriteLine("Starting S3 Robust Sync...");
@@ -39,6 +41,13 @@ class Program
                 ServiceURL = minioUrl,
                 ForcePathStyle = true,
             };
+
+            if (skipSsl)
+            {
+                Console.WriteLine("WARNING: SSL certificate validation is disabled for MinIO.");
+                minioConfig.HttpClientFactory = new SkipSslHttpClientFactory();
+            }
+
             using var minioClient = new AmazonS3Client(minioAccessKey, minioSecretKey, minioConfig);
 
             var awsConfig = new AmazonS3Config
