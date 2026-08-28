@@ -1,0 +1,62 @@
+name: Publish Release Binaries
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            binary_name: s3-robust-sync
+            asset_name: S3RobustSync-linux-x64
+          - os: ubuntu-latest
+            target: linux-arm64
+            binary_name: s3-robust-sync
+            asset_name: S3RobustSync-linux-arm64
+          - os: windows-latest
+            target: win-x64
+            binary_name: s3-robust-sync.exe
+            asset_name: S3RobustSync-win-x64.exe
+          - os: macos-latest
+            target: osx-x64
+            binary_name: s3-robust-sync
+            asset_name: S3RobustSync-osx-x64
+          - os: macos-latest
+            target: osx-arm64
+            binary_name: s3-robust-sync
+            asset_name: S3RobustSync-osx-arm64
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x' # Matches your environment
+
+      - name: Publish Single File
+        run: dotnet publish -c Release -r ${{ matrix.target }} --self-contained true -p:PublishSingleFile=true -o ./publish
+
+      - name: Rename Asset (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: mv ./publish/${{ matrix.binary_name }} ./publish/${{ matrix.asset_name }}
+
+      - name: Rename Asset (Windows)
+        if: runner.os == 'Windows'
+        run: Rename-Item -Path ".\publish\${{ matrix.binary_name }}" -NewName "${{ matrix.asset_name }}"
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ./publish/${{ matrix.asset_name }}
