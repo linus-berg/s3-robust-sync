@@ -1,4 +1,3 @@
-using System.Net.Http;
 using Amazon;
 using Amazon.S3;
 using Cocona;
@@ -25,14 +24,34 @@ class Program
             [Option("ignore-token", Description = "Ignore saved continuation token and restart scan from the beginning")] bool ignoreToken = false,
             [Option("db-path", Description = "Path to the SQLite database file")] string dbPath = "sync_state.db",
             [Option("temp-dir", Description = "Directory for temporary files during large file transfers")] string? tempDir = null,
-            [Option("skip-ssl", Description = "Skip SSL certificate validation for the MinIO connection")] bool skipSsl = false
+            [Option("skip-ssl", Description = "Skip SSL certificate validation for the MinIO connection")] bool skipSsl = false,
+            [Option("log-file", Description = "Path to a log file (output is written to both console and file)")] string? logFile = null
         ) =>
         {
-            Console.WriteLine("Starting S3 Robust Sync...");
-            if (!string.IsNullOrEmpty(prefix))
+            // Setup log tee if requested
+            using var teeWriter = new TeeTextWriter(Console.Out, logFile);
+            if (!string.IsNullOrEmpty(logFile))
             {
-                Console.WriteLine($"Filtering by prefix: {prefix}");
+                Console.SetOut(teeWriter);
             }
+
+            // Startup config summary
+            Console.WriteLine("╔══════════════════════════════════════════════════╗");
+            Console.WriteLine("║             S3 Robust Sync                      ║");
+            Console.WriteLine("╠══════════════════════════════════════════════════╣");
+            Console.WriteLine($"║  MinIO URL:       {minioUrl}");
+            Console.WriteLine($"║  MinIO Bucket:    {minioBucket}");
+            Console.WriteLine($"║  AWS Region:      {awsRegion}");
+            Console.WriteLine($"║  AWS Bucket:      {awsBucket}");
+            Console.WriteLine($"║  Prefix:          {prefix ?? "(none)"}");
+            Console.WriteLine($"║  Parallelism:     {parallelism}");
+            Console.WriteLine($"║  DB Path:         {dbPath}");
+            Console.WriteLine($"║  Temp Dir:        {tempDir ?? "(system default)"}");
+            Console.WriteLine($"║  Skip SSL:        {skipSsl}");
+            Console.WriteLine($"║  Ignore Token:    {ignoreToken}");
+            Console.WriteLine($"║  Log File:        {logFile ?? "(none)"}");
+            Console.WriteLine("╚══════════════════════════════════════════════════╝");
+            Console.WriteLine();
 
             var repository = new SyncStateRepository(dbPath);
 

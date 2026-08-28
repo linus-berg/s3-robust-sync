@@ -13,6 +13,8 @@ S3 Robust Sync is a highly resilient, high-performance command-line utility writ
 - **One-Shot Execution:** Operates as a definitive script—it aggressively syncs the entire bucket in a single pass and exits cleanly upon completion, making it perfect for CI/CD pipelines or cron jobs.
 - **One-Way Sync:** Designed purely as a pusher mechanism. It only lists files in the local MinIO bucket and streams them to AWS S3, dramatically reducing AWS API costs since it never lists or checks the remote AWS bucket directly.
 - **Graceful Shutdown:** Properly handles `Ctrl+C` cancellation instead of retrying cancelled operations.
+- **Skip SSL Validation:** Supports MinIO instances with self-signed certificates from private CAs via `--skip-ssl` (MinIO connection only; AWS remains fully validated).
+- **Log to File:** Optionally tee all output to a log file with `--log-file` for reviewing long-running syncs after the fact.
 
 ## Prerequisites
 
@@ -62,6 +64,9 @@ dotnet run -- [options]
   -p, --parallelism <Int32> Number of concurrent uploads (Default: 4)
   --ignore-token            Ignore saved continuation token and restart scan from the beginning
   --db-path <String>        Path to the SQLite database file (Default: sync_state.db)
+  --temp-dir <String>       Directory for temporary files during large file transfers (Default: system temp)
+  --skip-ssl                Skip SSL certificate validation for the MinIO connection
+  --log-file <String>       Path to a log file (output is written to both console and file)
   -h, --help                Show help message
 ```
 
@@ -95,6 +100,39 @@ dotnet run -- --minio-bucket "bucket-a" --aws-bucket "bucket-a-remote" --db-path
 
 # Job 2: sync bucket-b (separate state tracking)
 dotnet run -- --minio-bucket "bucket-b" --aws-bucket "bucket-b-remote" --db-path "sync_bucket_b.db"
+```
+
+**Self-Signed MinIO with Logging:**
+```bash
+dotnet run -- \
+  --minio-url "https://minio.internal:9000" \
+  --skip-ssl \
+  --minio-bucket "data" \
+  --aws-bucket "data-backup" \
+  --log-file "/var/log/s3-sync.log" \
+  --temp-dir "/mnt/fast-ssd/tmp"
+```
+
+## Startup Summary
+
+When the program starts, it prints a structured configuration summary so you can always verify what it's doing:
+
+```
+╔══════════════════════════════════════════════════╗
+║             S3 Robust Sync                      ║
+╠══════════════════════════════════════════════════╣
+║  MinIO URL:       https://minio.internal:9000
+║  MinIO Bucket:    sensor-data
+║  AWS Region:      us-west-2
+║  AWS Bucket:      production-sensor-data
+║  Prefix:          2026/08/
+║  Parallelism:     16
+║  DB Path:         sync_state.db
+║  Temp Dir:        /mnt/fast-ssd/tmp
+║  Skip SSL:        True
+║  Ignore Token:    False
+║  Log File:        /var/log/s3-sync.log
+╚══════════════════════════════════════════════════╝
 ```
 
 ## How It Works
