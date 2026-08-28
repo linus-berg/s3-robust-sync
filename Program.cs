@@ -21,7 +21,8 @@ class Program
             [Option("aws-access", Description = "AWS Access Key")] string awsAccessKey = "aws_access_key",
             [Option("aws-secret", Description = "AWS Secret Key")] string awsSecretKey = "aws_secret_key",
             [Option("aws-bucket", Description = "AWS Bucket")] string awsBucket = "aws-bucket",
-            [Option("prefix", Description = "Prefix to filter objects in MinIO")] string? prefix = null
+            [Option("prefix", Description = "Prefix to filter objects in MinIO")] string? prefix = null,
+            [Option('p', Description = "Number of concurrent uploads")] int parallelism = 4
         ) =>
         {
             Console.WriteLine("Starting S3 Robust Sync...");
@@ -32,7 +33,7 @@ class Program
 
             string dbPath = "sync_state.db";
 
-            using var repository = new SyncStateRepository(dbPath);
+            var repository = new SyncStateRepository(dbPath);
 
             var minioConfig = new AmazonS3Config
             {
@@ -53,7 +54,8 @@ class Program
                 repository,
                 minioBucket,
                 awsBucket,
-                prefix);
+                prefix,
+                parallelism);
 
             await syncService.RunContinuousSyncAsync();
         });

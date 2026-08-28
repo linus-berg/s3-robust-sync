@@ -3,20 +3,21 @@ using Microsoft.Data.Sqlite;
 
 namespace S3RobustSync;
 
-public class SyncStateRepository : IDisposable
+public class SyncStateRepository
 {
-    private readonly SqliteConnection _connection;
+    private readonly string _connectionString;
 
     public SyncStateRepository(string dbPath)
     {
-        _connection = new SqliteConnection($"Data Source={dbPath}");
-        _connection.Open();
+        _connectionString = $"Data Source={dbPath}";
         InitializeDatabase();
     }
 
     private void InitializeDatabase()
     {
-        var command = _connection.CreateCommand();
+        using var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        var command = connection.CreateCommand();
         command.CommandText = @"
             PRAGMA journal_mode = WAL;
             CREATE TABLE IF NOT EXISTS SyncedFiles (
@@ -27,7 +28,9 @@ public class SyncStateRepository : IDisposable
 
     public bool IsFileSynced(string key)
     {
-        var command = _connection.CreateCommand();
+        using var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        var command = connection.CreateCommand();
         command.CommandText = "SELECT 1 FROM SyncedFiles WHERE ObjectKey = $key";
         command.Parameters.AddWithValue("$key", key);
 
@@ -37,14 +40,11 @@ public class SyncStateRepository : IDisposable
 
     public void MarkFileSynced(string key)
     {
-        var command = _connection.CreateCommand();
+        using var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        var command = connection.CreateCommand();
         command.CommandText = "INSERT OR IGNORE INTO SyncedFiles (ObjectKey) VALUES ($key)";
         command.Parameters.AddWithValue("$key", key);
         command.ExecuteNonQuery();
-    }
-
-    public void Dispose()
-    {
-        _connection.Dispose();
     }
 }

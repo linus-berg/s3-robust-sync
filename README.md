@@ -52,6 +52,7 @@ dotnet run -- [options]
   --aws-secret <String>     AWS Secret Key (Default: aws_secret_key)
   --aws-bucket <String>     AWS Bucket (Default: aws-bucket)
   --prefix <String>         Prefix to filter objects in MinIO
+  -p, --parallelism <Int32> Number of concurrent uploads (Default: 4)
   -h, --help                Show help message
 ```
 

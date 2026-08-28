@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 using Amazon.S3;
 using Amazon.S3.Model;
@@ -16,6 +17,7 @@ public class S3SyncService
     private readonly string _minioBucket;
     private readonly string _awsBucket;
     private readonly string? _prefix;
+    private readonly int _parallelism;
     private readonly AsyncRetryPolicy _retryPolicy;
 
     public S3SyncService(
@@ -24,7 +26,8 @@ public class S3SyncService
         SyncStateRepository repository,
         string minioBucket,
         string awsBucket,
-        string? prefix)
+        string? prefix,
+        int parallelism)
     {
         _minioClient = minioClient;
         _awsClient = awsClient;
@@ -32,6 +35,7 @@ public class S3SyncService
         _minioBucket = minioBucket;
         _awsBucket = awsBucket;
         _prefix = prefix;
+        _parallelism = parallelism;
 
         _retryPolicy = Policy
             .Handle<Exception>()
@@ -46,7 +50,7 @@ public class S3SyncService
 
     public async Task RunContinuousSyncAsync()
     {
-        Console.WriteLine("Starting continuous sync loop...");
+        Console.WriteLine($"Starting continuous sync loop with {_parallelism} concurrent uploads...");
         using var transferUtility = new TransferUtility(_awsClient);
 
         while (true)
@@ -70,11 +74,16 @@ public class S3SyncService
                         return await _minioClient.ListObjectsV2Async(listRequest);
                     });
 
-                    foreach (var s3Object in listResponse.S3Objects)
+                    var parallelOptions = new ParallelOptions
+                    {
+                        MaxDegreeOfParallelism = _parallelism
+                    };
+
+                    await Parallel.ForEachAsync(listResponse.S3Objects, parallelOptions, async (s3Object, cancellationToken) =>
                     {
                         if (_repository.IsFileSynced(s3Object.Key))
                         {
-                            continue;
+                            return; // skip if already synced
                         }
 
                         Console.WriteLine($"[{DateTime.UtcNow:O}] Syncing: {s3Object.Key} ({(s3Object.Size / 1024.0 / 1024.0):F2} MB)");
@@ -88,7 +97,7 @@ public class S3SyncService
                                 Key = s3Object.Key
                             };
 
-                            using var getResponse = await _minioClient.GetObjectAsync(getRequest);
+                            using var getResponse = await _minioClient.GetObjectAsync(getRequest, cancellationToken);
 
                             // 3. Use TransferUtility to handle files > 5GB via automatic multipart upload chunking
                             var uploadRequest = new TransferUtilityUploadRequest
@@ -99,13 +108,13 @@ public class S3SyncService
                                 ContentType = getResponse.Headers.ContentType
                             };
 
-                            await transferUtility.UploadAsync(uploadRequest);
+                            await transferUtility.UploadAsync(uploadRequest, cancellationToken);
                         });
 
                         // 4. Record as synced ONLY after complete success
                         _repository.MarkFileSynced(s3Object.Key);
                         Console.WriteLine($"[{DateTime.UtcNow:O}] Successfully synced: {s3Object.Key}");
-                    }
+                    });
 
                     continuationToken = listResponse.NextContinuationToken;
 
