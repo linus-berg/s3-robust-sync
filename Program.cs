@@ -1,5 +1,3 @@
-using System;
-using System.Threading.Tasks;
 using Amazon;
 using Amazon.S3;
 using Cocona;
@@ -23,7 +21,9 @@ class Program
             [Option("aws-bucket", Description = "AWS Bucket")] string awsBucket = "aws-bucket",
             [Option("prefix", Description = "Prefix to filter objects in MinIO")] string? prefix = null,
             [Option('p', Description = "Number of concurrent uploads")] int parallelism = 4,
-            [Option("ignore-token", Description = "Ignore saved continuation token and restart scan from the beginning")] bool ignoreToken = false
+            [Option("ignore-token", Description = "Ignore saved continuation token and restart scan from the beginning")] bool ignoreToken = false,
+            [Option("db-path", Description = "Path to the SQLite database file")] string dbPath = "sync_state.db",
+            [Option("temp-dir", Description = "Directory for temporary files during large file transfers")] string? tempDir = null
         ) =>
         {
             Console.WriteLine("Starting S3 Robust Sync...");
@@ -31,8 +31,6 @@ class Program
             {
                 Console.WriteLine($"Filtering by prefix: {prefix}");
             }
-
-            string dbPath = "sync_state.db";
 
             var repository = new SyncStateRepository(dbPath);
 
@@ -49,6 +47,11 @@ class Program
             };
             using var awsClient = new AmazonS3Client(awsAccessKey, awsSecretKey, awsConfig);
 
+            if (!string.IsNullOrEmpty(tempDir))
+            {
+                Directory.CreateDirectory(tempDir);
+            }
+
             var syncService = new S3SyncService(
                 minioClient,
                 awsClient,
@@ -57,7 +60,8 @@ class Program
                 awsBucket,
                 prefix,
                 parallelism,
-                ignoreToken);
+                ignoreToken,
+                tempDir);
 
             await syncService.RunSyncAsync();
         });

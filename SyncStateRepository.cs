@@ -1,4 +1,3 @@
-using System;
 using Microsoft.Data.Sqlite;
 
 namespace S3RobustSync;
@@ -9,7 +8,7 @@ public class SyncStateRepository
 
     public SyncStateRepository(string dbPath)
     {
-        _connectionString = $"Data Source={dbPath}";
+        _connectionString = $"Data Source={dbPath};Pooling=true";
         InitializeDatabase();
     }
 
