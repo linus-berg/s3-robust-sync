@@ -18,6 +18,7 @@ public class SyncStateRepository : IDisposable
     {
         var command = _connection.CreateCommand();
         command.CommandText = @"
+            PRAGMA journal_mode = WAL;
             CREATE TABLE IF NOT EXISTS SyncedFiles (
                 ObjectKey TEXT PRIMARY KEY
             );";

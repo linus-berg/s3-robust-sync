@@ -2,6 +2,7 @@ using System;
 using System.Threading.Tasks;
 using Amazon.S3;
 using Amazon.S3.Model;
+using Amazon.S3.Transfer;
 using Polly;
 using Polly.Retry;
 
@@ -46,15 +47,18 @@ public class S3SyncService
     public async Task RunContinuousSyncAsync()
     {
         Console.WriteLine("Starting continuous sync loop...");
+        using var transferUtility = new TransferUtility(_awsClient);
 
         while (true)
         {
             try
             {
-                await _retryPolicy.ExecuteAsync(async () =>
+                string? continuationToken = null;
+                do
                 {
-                    string? continuationToken = null;
-                    do
+                    // 1. Isolate the list operation with its own retry, 
+                    // so if something fails, we don't lose the continuation token.
+                    ListObjectsV2Response listResponse = await _retryPolicy.ExecuteAsync(async () =>
                     {
                         var listRequest = new ListObjectsV2Request
                         {
@@ -63,17 +67,21 @@ public class S3SyncService
                             Prefix = _prefix
                         };
 
-                        var listResponse = await _minioClient.ListObjectsV2Async(listRequest);
+                        return await _minioClient.ListObjectsV2Async(listRequest);
+                    });
 
-                        foreach (var s3Object in listResponse.S3Objects)
+                    foreach (var s3Object in listResponse.S3Objects)
+                    {
+                        if (_repository.IsFileSynced(s3Object.Key))
                         {
-                            if (_repository.IsFileSynced(s3Object.Key))
-                            {
-                                continue;
-                            }
+                            continue;
+                        }
 
-                            Console.WriteLine($"[{DateTime.UtcNow:O}] Syncing: {s3Object.Key}");
+                        Console.WriteLine($"[{DateTime.UtcNow:O}] Syncing: {s3Object.Key} ({(s3Object.Size / 1024.0 / 1024.0):F2} MB)");
 
+                        // 2. Isolate the transfer with its own retry.
+                        await _retryPolicy.ExecuteAsync(async () =>
+                        {
                             var getRequest = new GetObjectRequest
                             {
                                 BucketName = _minioBucket,
@@ -82,26 +90,28 @@ public class S3SyncService
 
                             using var getResponse = await _minioClient.GetObjectAsync(getRequest);
 
-                            var putRequest = new PutObjectRequest
+                            // 3. Use TransferUtility to handle files > 5GB via automatic multipart upload chunking
+                            var uploadRequest = new TransferUtilityUploadRequest
                             {
-                                BucketName = _awsBucket,
-                                Key = s3Object.Key,
                                 InputStream = getResponse.ResponseStream,
-                                ContentType = getResponse.Headers.ContentType,
-                                Headers = { ContentLength = getResponse.ContentLength }
+                                Key = s3Object.Key,
+                                BucketName = _awsBucket,
+                                ContentType = getResponse.Headers.ContentType
                             };
 
-                            await _awsClient.PutObjectAsync(putRequest);
+                            await transferUtility.UploadAsync(uploadRequest);
+                        });
 
-                            _repository.MarkFileSynced(s3Object.Key);
-                            Console.WriteLine($"[{DateTime.UtcNow:O}] Successfully synced: {s3Object.Key}");
-                        }
+                        // 4. Record as synced ONLY after complete success
+                        _repository.MarkFileSynced(s3Object.Key);
+                        Console.WriteLine($"[{DateTime.UtcNow:O}] Successfully synced: {s3Object.Key}");
+                    }
 
-                        continuationToken = listResponse.NextContinuationToken;
+                    continuationToken = listResponse.NextContinuationToken;
 
-                    } while (continuationToken != null);
-                });
+                } while (continuationToken != null);
 
+                // Wait a bit before checking for completely new files
                 await Task.Delay(TimeSpan.FromSeconds(30));
             }
             catch (Exception ex)
