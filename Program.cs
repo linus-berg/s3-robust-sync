@@ -55,23 +55,27 @@ class Program
 
             var repository = new SyncStateRepository(dbPath);
 
+            // Allow enough HTTP connections for all parallel workers + headroom for listing
+            int maxConnections = parallelism + 4;
+
             var minioConfig = new AmazonS3Config
             {
                 ServiceURL = minioUrl,
                 ForcePathStyle = true,
+                HttpClientFactory = new ConfigurableHttpClientFactory(maxConnections, skipSsl),
             };
 
             if (skipSsl)
             {
                 Console.WriteLine("WARNING: SSL certificate validation is disabled for MinIO.");
-                minioConfig.HttpClientFactory = new SkipSslHttpClientFactory();
             }
 
             using var minioClient = new AmazonS3Client(minioAccessKey, minioSecretKey, minioConfig);
 
             var awsConfig = new AmazonS3Config
             {
-                RegionEndpoint = RegionEndpoint.GetBySystemName(awsRegion)
+                RegionEndpoint = RegionEndpoint.GetBySystemName(awsRegion),
+                HttpClientFactory = new ConfigurableHttpClientFactory(maxConnections),
             };
             using var awsClient = new AmazonS3Client(awsAccessKey, awsSecretKey, awsConfig);
 

@@ -1,3 +1,4 @@
+using System.Threading.Channels;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Amazon.S3.Transfer;
@@ -78,78 +79,101 @@ public class S3SyncService
             }
         }
 
+        // Bounded channel acts as the bridge between the listing producer and upload consumers.
+        // Buffer a few pages ahead so the producer can stay ahead of the consumers.
+        var channel = Channel.CreateBounded<S3Object>(new BoundedChannelOptions(_parallelism * 500)
+        {
+            SingleWriter = true,
+            FullMode = BoundedChannelFullMode.Wait
+        });
+
         try
         {
-            do
+            // Producer: continuously pages through MinIO and feeds objects into the channel.
+            var producerTask = Task.Run(async () =>
             {
-                // 1. Isolate the list operation with its own retry,
-                // so if something fails, we don't lose the continuation token.
-                ListObjectsV2Response listResponse = await _retryPolicy.ExecuteAsync(async () =>
+                try
                 {
-                    var listRequest = new ListObjectsV2Request
+                    do
                     {
-                        BucketName = _minioBucket,
-                        ContinuationToken = continuationToken,
-                        Prefix = _prefix
-                    };
+                        ListObjectsV2Response listResponse = await _retryPolicy.ExecuteAsync(async () =>
+                        {
+                            var listRequest = new ListObjectsV2Request
+                            {
+                                BucketName = _minioBucket,
+                                ContinuationToken = continuationToken,
+                                Prefix = _prefix
+                            };
 
-                    return await _minioClient.ListObjectsV2Async(listRequest);
-                });
+                            return await _minioClient.ListObjectsV2Async(listRequest);
+                        });
 
-                var parallelOptions = new ParallelOptions
+                        foreach (var s3Object in listResponse.S3Objects)
+                        {
+                            await channel.Writer.WriteAsync(s3Object);
+                        }
+
+                        continuationToken = listResponse.NextContinuationToken;
+
+                        // Checkpoint the token after each page so restarts resume from here.
+                        // Files from this page that haven't been uploaded yet will be
+                        // re-checked against the SQLite database and skipped instantly.
+                        _repository.SaveContinuationToken(continuationToken);
+
+                    } while (continuationToken != null);
+                }
+                finally
                 {
-                    MaxDegreeOfParallelism = _parallelism
-                };
+                    channel.Writer.Complete();
+                }
+            });
 
-                await Parallel.ForEachAsync(listResponse.S3Objects, parallelOptions, async (s3Object, cancellationToken) =>
+            // Consumers: read from the channel and upload in parallel.
+            var parallelOptions = new ParallelOptions
+            {
+                MaxDegreeOfParallelism = _parallelism
+            };
+
+            await Parallel.ForEachAsync(channel.Reader.ReadAllAsync(), parallelOptions, async (s3Object, cancellationToken) =>
+            {
+                long processed = Interlocked.Increment(ref _totalProcessed);
+
+                if (_repository.IsFileSynced(s3Object.Key))
                 {
-                    long processed = Interlocked.Increment(ref _totalProcessed);
-
-                    if (_repository.IsFileSynced(s3Object.Key))
-                    {
-                        Interlocked.Increment(ref _totalSkipped);
-                        if (processed % 10_000 == 0)
-                        {
-                            PrintProgress();
-                        }
-                        return;
-                    }
-
-                    Console.WriteLine($"[{DateTime.UtcNow:O}] Syncing: {s3Object.Key} ({FormatSize(s3Object.Size.GetValueOrDefault())})");
-
-                    // 2. Isolate the transfer with its own retry.
-                    await _retryPolicy.ExecuteAsync(async () =>
-                    {
-                        if (s3Object.Size.GetValueOrDefault() > LargeFileThreshold)
-                        {
-                            // Large file path: download to temp file first so TransferUtility
-                            // can seek for multipart uploads and retry individual parts.
-                            await TransferViaTemporaryFile(s3Object, transferUtility, cancellationToken);
-                        }
-                        else
-                        {
-                            // Small file path: stream directly from MinIO to AWS.
-                            await TransferViaStream(s3Object, transferUtility, cancellationToken);
-                        }
-                    });
-
-                    // 3. Record as synced ONLY after complete success
-                    _repository.MarkFileSynced(s3Object.Key);
-                    long synced = Interlocked.Increment(ref _totalSynced);
-                    Console.WriteLine($"[{DateTime.UtcNow:O}] Successfully synced: {s3Object.Key}");
-
-                    if (synced % 1_000 == 0)
+                    Interlocked.Increment(ref _totalSkipped);
+                    if (processed % 10_000 == 0)
                     {
                         PrintProgress();
                     }
+                    return;
+                }
+
+                Console.WriteLine($"[{DateTime.UtcNow:O}] Syncing: {s3Object.Key} ({FormatSize(s3Object.Size.GetValueOrDefault())})");
+
+                await _retryPolicy.ExecuteAsync(async () =>
+                {
+                    if (s3Object.Size.GetValueOrDefault() > LargeFileThreshold)
+                    {
+                        await TransferViaTemporaryFile(s3Object, transferUtility, cancellationToken);
+                    }
+                    else
+                    {
+                        await TransferViaStream(s3Object, transferUtility, cancellationToken);
+                    }
                 });
 
-                continuationToken = listResponse.NextContinuationToken;
+                _repository.MarkFileSynced(s3Object.Key);
+                long synced = Interlocked.Increment(ref _totalSynced);
+                Console.WriteLine($"[{DateTime.UtcNow:O}] Successfully synced: {s3Object.Key}");
 
-                // Safely store the token so if we crash right now, we resume at this exact page
-                _repository.SaveContinuationToken(continuationToken);
+                if (synced % 1_000 == 0)
+                {
+                    PrintProgress();
+                }
+            });
 
-            } while (continuationToken != null);
+            // Ensure the producer finished cleanly (surfaces any exceptions it threw).
+            await producerTask;
 
             PrintProgress();
             Console.WriteLine($"[{DateTime.UtcNow:O}] Sync completely finished. Exiting.");
