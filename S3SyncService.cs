@@ -16,7 +16,6 @@ public class S3SyncService
     private readonly string _awsBucket;
     private readonly string? _prefix;
     private readonly int _parallelism;
-    private readonly bool _ignoreToken;
     private readonly string? _tempDir;
     private readonly AsyncRetryPolicy _retryPolicy;
 
@@ -39,7 +38,6 @@ public class S3SyncService
         string awsBucket,
         string? prefix,
         int parallelism,
-        bool ignoreToken,
         string? tempDir)
     {
         _minioClient = minioClient;
@@ -50,7 +48,6 @@ public class S3SyncService
         _prefix = prefix;
         _tempDir = tempDir;
         _parallelism = parallelism;
-        _ignoreToken = ignoreToken;
 
         _retryPolicy = Policy
             .Handle<Exception>(ex => ex is not OperationCanceledException)
@@ -69,16 +66,6 @@ public class S3SyncService
         Console.WriteLine($"Starting one-shot sync with {_parallelism} concurrent uploads...");
         using var transferUtility = new TransferUtility(_awsClient);
 
-        string? continuationToken = null;
-        if (!_ignoreToken)
-        {
-            continuationToken = _repository.GetContinuationToken();
-            if (!string.IsNullOrEmpty(continuationToken))
-            {
-                Console.WriteLine("Resuming from saved continuation token in the database...");
-            }
-        }
-
         // Bounded channel acts as the bridge between the listing producer and upload consumers.
         // Buffer a few pages ahead so the producer can stay ahead of the consumers.
         var channel = Channel.CreateBounded<S3Object>(new BoundedChannelOptions(_parallelism * 500)
@@ -92,6 +79,7 @@ public class S3SyncService
             // Producer: continuously pages through MinIO and feeds objects into the channel.
             var producerTask = Task.Run(async () =>
             {
+                string? continuationToken = null;
                 try
                 {
                     do
@@ -114,11 +102,6 @@ public class S3SyncService
                         }
 
                         continuationToken = listResponse.NextContinuationToken;
-
-                        // Checkpoint the token after each page so restarts resume from here.
-                        // Files from this page that haven't been uploaded yet will be
-                        // re-checked against the SQLite database and skipped instantly.
-                        _repository.SaveContinuationToken(continuationToken);
 
                     } while (continuationToken != null);
                 }

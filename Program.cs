@@ -21,7 +21,6 @@ class Program
             [Option("aws-bucket", Description = "AWS Bucket")] string awsBucket = "aws-bucket",
             [Option("prefix", Description = "Prefix to filter objects in MinIO")] string? prefix = null,
             [Option('p', Description = "Number of concurrent uploads")] int parallelism = 4,
-            [Option("ignore-token", Description = "Ignore saved continuation token and restart scan from the beginning")] bool ignoreToken = false,
             [Option("db-path", Description = "Path to the SQLite database file")] string dbPath = "sync_state.db",
             [Option("temp-dir", Description = "Directory for temporary files during large file transfers")] string? tempDir = null,
             [Option("skip-ssl", Description = "Skip SSL certificate validation for the MinIO connection")] bool skipSsl = false,
@@ -48,7 +47,6 @@ class Program
             Console.WriteLine($"║  DB Path:         {dbPath}");
             Console.WriteLine($"║  Temp Dir:        {tempDir ?? "(system default)"}");
             Console.WriteLine($"║  Skip SSL:        {skipSsl}");
-            Console.WriteLine($"║  Ignore Token:    {ignoreToken}");
             Console.WriteLine($"║  Log File:        {logFile ?? "(none)"}");
             Console.WriteLine("╚══════════════════════════════════════════════════╝");
             Console.WriteLine();
@@ -92,7 +90,6 @@ class Program
                 awsBucket,
                 prefix,
                 parallelism,
-                ignoreToken,
                 tempDir);
 
             await syncService.RunSyncAsync();

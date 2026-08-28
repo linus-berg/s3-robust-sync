@@ -21,42 +21,7 @@ public class SyncStateRepository
             PRAGMA journal_mode = WAL;
             CREATE TABLE IF NOT EXISTS SyncedFiles (
                 ObjectKey TEXT PRIMARY KEY
-            );
-            CREATE TABLE IF NOT EXISTS SyncMetadata (
-                Key TEXT PRIMARY KEY,
-                Value TEXT
             );";
-        command.ExecuteNonQuery();
-    }
-
-    public string? GetContinuationToken()
-    {
-        using var connection = new SqliteConnection(_connectionString);
-        connection.Open();
-        var command = connection.CreateCommand();
-        command.CommandText = "SELECT Value FROM SyncMetadata WHERE Key = 'ContinuationToken'";
-        using var reader = command.ExecuteReader();
-        if (reader.Read())
-        {
-            return reader.GetString(0);
-        }
-        return null;
-    }
-
-    public void SaveContinuationToken(string? token)
-    {
-        using var connection = new SqliteConnection(_connectionString);
-        connection.Open();
-        var command = connection.CreateCommand();
-        if (string.IsNullOrEmpty(token))
-        {
-            command.CommandText = "DELETE FROM SyncMetadata WHERE Key = 'ContinuationToken'";
-        }
-        else
-        {
-            command.CommandText = "INSERT OR REPLACE INTO SyncMetadata (Key, Value) VALUES ('ContinuationToken', $token)";
-            command.Parameters.AddWithValue("$token", token);
-        }
         command.ExecuteNonQuery();
     }
 

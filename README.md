@@ -1,21 +1,20 @@
 # S3 Robust Sync
 
-S3 Robust Sync is a highly resilient, high-performance command-line utility written in .NET to seamlessly synchronize massive datasets (millions of files, large objects) from a local MinIO bucket to a remote AWS S3 bucket.
+S3 Robust Sync is a highly resilient, high-performance command-line utility written in .NET to synchronize massive datasets (millions of files, large objects) from a local MinIO bucket to a remote AWS S3 bucket.
 
 ## Key Features
 
 - **Infinite Resilience:** Designed to handle severe network interruptions (even hours of downtime). Uses Polly for exponential backoff retries with jitter. When the internet comes back, the sync seamlessly resumes exactly where it left off.
-- **Stateful Resumption:** Utilizes a local SQLite database with Write-Ahead Logging (WAL) and connection pooling to persistently track successfully transferred objects. If the program is restarted, it will instantly skip over already synced files.
-- **Continuation Token Caching:** Safely checkpoints your MinIO pagination cursor directly into the database. If your sync of 70 million files crashes halfway through, it resumes *instantly* at the exact position without rescanning the entire bucket.
-- **High-Performance Parallelism:** Transfers multiple files concurrently using a pipelined producer-consumer architecture. Upload workers never sit idle waiting for MinIO listing calls.
+- **Stateful Deduplication:** Utilizes a local SQLite database with Write-Ahead Logging (WAL) and connection pooling to persistently track successfully transferred objects. On restart, already-synced files are skipped instantly.
+- **Pipelined Architecture:** Uses a producer-consumer pipeline built on `Channel<T>`. Listing and uploading happen concurrently — upload workers are never idle waiting for the next MinIO listing call.
+- **High-Performance Parallelism:** Transfers multiple files concurrently. HTTP connection pools are automatically scaled to match your parallelism setting.
 - **Large File Safety:** Files over 100MB are automatically downloaded to a temporary file before uploading, allowing `TransferUtility` to seek freely for reliable multipart uploads. Smaller files are streamed directly for maximum speed.
-- **Connection Pool Tuning:** HTTP connection limits are automatically scaled to match your parallelism setting, preventing hidden throttling from default connection caps.
-- **Progress Tracking:** Periodic progress summaries show how many files have been processed, synced, and skipped.
 - **One-Shot Execution:** Syncs the entire bucket in a single pass and exits cleanly, making it perfect for scripts, cron jobs, or CI/CD pipelines.
 - **One-Way Sync:** Only lists files in the local MinIO bucket and pushes them to AWS S3. It never lists or checks the remote AWS bucket, dramatically reducing AWS API costs.
 - **Graceful Shutdown:** Properly handles `Ctrl+C` cancellation instead of retrying cancelled operations.
 - **Skip SSL Validation:** Supports MinIO instances with self-signed certificates from private CAs via `--skip-ssl` (MinIO connection only; AWS remains fully validated).
 - **Log to File:** Optionally tee all output to a log file with `--log-file` for reviewing long-running syncs after the fact.
+- **Progress Tracking:** Periodic progress summaries show how many files have been processed, synced, and skipped.
 
 ## Prerequisites
 
@@ -63,7 +62,6 @@ dotnet run -- [options]
   --aws-bucket <String>     AWS Bucket (Default: aws-bucket)
   --prefix <String>         Prefix to filter objects in MinIO
   -p, --parallelism <Int32> Number of concurrent uploads (Default: 4)
-  --ignore-token            Ignore saved continuation token and restart scan from the beginning
   --db-path <String>        Path to the SQLite database file (Default: sync_state.db)
   --temp-dir <String>       Directory for temporary files during large file transfers (Default: system temp)
   --skip-ssl                Skip SSL certificate validation for the MinIO connection
@@ -78,7 +76,7 @@ dotnet run -- [options]
 dotnet run -- --minio-bucket "my-local-bucket" --aws-bucket "my-remote-bucket"
 ```
 
-**High-Speed Sync with Prefix & Forced Rescan:**
+**High-Speed Sync with Prefix:**
 ```bash
 dotnet run -- \
   --minio-url "http://192.168.1.50:9000" \
@@ -90,8 +88,7 @@ dotnet run -- \
   --aws-secret "secret..." \
   --aws-bucket "production-sensor-data" \
   --prefix "2026/08/" \
-  --parallelism 16 \
-  --ignore-token
+  --parallelism 16
 ```
 
 **Multiple Sync Jobs from the Same Directory:**
@@ -131,7 +128,6 @@ When the program starts, it prints a structured configuration summary:
 ║  DB Path:         sync_state.db
 ║  Temp Dir:        /mnt/fast-ssd/tmp
 ║  Skip SSL:        True
-║  Ignore Token:    False
 ║  Log File:        /var/log/s3-sync.log
 ╚══════════════════════════════════════════════════╝
 ```
@@ -164,7 +160,6 @@ flowchart LR
     CH --> C1 & C2 & C3
     C1 & C2 & C3 -->|"Check/Mark"| DB
     C1 & C2 & C3 -->|"GetObject → PutObject"| AWS
-    P -->|"Save Token"| DB
 ```
 
 ### Producer-Consumer Pipeline
@@ -182,9 +177,8 @@ sequenceDiagram
     participant SQLite
 
     Producer->>MinIO: ListObjectsV2 (page 1)
-    MinIO-->>Producer: 1000 objects + token
+    MinIO-->>Producer: 1000 objects
     Producer->>Channel: Write 1000 objects
-    Producer->>SQLite: Save continuation token
 
     par Upload Workers
         Worker1->>Channel: Read object
@@ -201,9 +195,8 @@ sequenceDiagram
         SQLite-->>Worker2: Yes (skip)
     and Producer continues listing
         Producer->>MinIO: ListObjectsV2 (page 2)
-        MinIO-->>Producer: 1000 objects + token
+        MinIO-->>Producer: 1000 objects
         Producer->>Channel: Write 1000 objects
-        Producer->>SQLite: Save continuation token
     end
 ```
 
@@ -265,14 +258,10 @@ erDiagram
     SyncedFiles {
         TEXT ObjectKey PK "S3 object key"
     }
-    SyncMetadata {
-        TEXT Key PK "e.g. 'ContinuationToken'"
-        TEXT Value "Token value"
-    }
 ```
 
-- **`SyncedFiles`** — Every successfully uploaded object key is recorded here. On restart, files present in this table are skipped instantly.
-- **`SyncMetadata`** — Stores the MinIO pagination cursor (`ContinuationToken`). On restart, the listing resumes from this checkpoint instead of re-scanning from the beginning.
+- Every successfully uploaded object key is recorded in the `SyncedFiles` table.
+- On restart, each file is checked against this table and skipped if already synced.
 - The database uses **WAL mode** for concurrent read/write safety and **connection pooling** for performance.
 
 ### Connection Pool Tuning
@@ -307,12 +296,12 @@ HTTP connection pools are automatically sized to `parallelism + 4`, ensuring tha
 
 ## How It Works (Step by Step)
 
-1. **Startup**: Prints the configuration summary. Creates or opens the SQLite database. Optionally resumes from a saved continuation token.
-2. **Producer starts**: A background task begins paginating through the MinIO bucket, writing `S3Object` references into a bounded channel. After each page, it checkpoints the continuation token to the database.
+1. **Startup**: Prints the configuration summary. Creates or opens the SQLite database with WAL mode.
+2. **Producer starts**: A background task begins paginating through the entire MinIO bucket, writing `S3Object` references into a bounded channel.
 3. **Workers consume**: N parallel workers read from the channel. For each object:
    - Check the SQLite database — skip if already synced.
    - Download from MinIO and upload to AWS (direct stream for small files, temp file for large files).
    - Record the object key in SQLite on success.
 4. **Retries**: Any network failure on any operation triggers infinite retries with exponential backoff + jitter. Other workers and the producer are unaffected.
 5. **Completion**: Once the producer has listed every object and the workers have drained the channel, the program prints a final progress summary and exits with code 0.
-6. **Crash recovery**: On restart, the program loads the continuation token from SQLite and resumes listing from that point. Any objects from the last partially-processed page are checked against the `SyncedFiles` table and skipped if already uploaded.
+6. **Restart**: On restart, the program lists the entire bucket again from the beginning. Already-synced files are checked against the `SyncedFiles` table and skipped instantly — only the listing API cost is repeated, no redundant uploads occur.
