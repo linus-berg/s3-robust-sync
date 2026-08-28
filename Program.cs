@@ -22,7 +22,8 @@ class Program
             [Option("aws-secret", Description = "AWS Secret Key")] string awsSecretKey = "aws_secret_key",
             [Option("aws-bucket", Description = "AWS Bucket")] string awsBucket = "aws-bucket",
             [Option("prefix", Description = "Prefix to filter objects in MinIO")] string? prefix = null,
-            [Option('p', Description = "Number of concurrent uploads")] int parallelism = 4
+            [Option('p', Description = "Number of concurrent uploads")] int parallelism = 4,
+            [Option("ignore-token", Description = "Ignore saved continuation token and restart scan from the beginning")] bool ignoreToken = false
         ) =>
         {
             Console.WriteLine("Starting S3 Robust Sync...");
@@ -55,9 +56,10 @@ class Program
                 minioBucket,
                 awsBucket,
                 prefix,
-                parallelism);
+                parallelism,
+                ignoreToken);
 
-            await syncService.RunContinuousSyncAsync();
+            await syncService.RunSyncAsync();
         });
 
         await app.RunAsync();
