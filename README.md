@@ -5,13 +5,14 @@ S3 Robust Sync is a highly resilient, high-performance command-line utility writ
 ## Key Features
 
 - **Infinite Resilience:** Designed to handle severe network interruptions (even hours of downtime). Uses Polly for exponential backoff retries with jitter. When the internet comes back, the sync seamlessly resumes exactly where it left off.
-- **Stateful Resumption:** Utilizes a local SQLite database (`sync_state.db`) with Write-Ahead Logging (WAL) and connection pooling to persistently track successfully transferred objects. If the program is restarted, it will instantly skip over already synced files.
-- **Continuation Token Caching:** Safely checkpoints your MinIO pagination (`ContinuationToken`) directly into the database. If your sync of 70 million files crashes halfway through, it resumes *instantly* at the exact cursor position without rescanning the entire bucket!
-- **High-Performance Parallelism:** Transfers multiple files concurrently and uses AWS `TransferUtility` to automatically chunk large 5GB+ files into memory-efficient multipart uploads.
+- **Stateful Resumption:** Utilizes a local SQLite database with Write-Ahead Logging (WAL) and connection pooling to persistently track successfully transferred objects. If the program is restarted, it will instantly skip over already synced files.
+- **Continuation Token Caching:** Safely checkpoints your MinIO pagination cursor directly into the database. If your sync of 70 million files crashes halfway through, it resumes *instantly* at the exact position without rescanning the entire bucket.
+- **High-Performance Parallelism:** Transfers multiple files concurrently using a pipelined producer-consumer architecture. Upload workers never sit idle waiting for MinIO listing calls.
 - **Large File Safety:** Files over 100MB are automatically downloaded to a temporary file before uploading, allowing `TransferUtility` to seek freely for reliable multipart uploads. Smaller files are streamed directly for maximum speed.
-- **Progress Tracking:** Periodic progress summaries are printed so you always know how many files have been processed, synced, and skipped during a run.
-- **One-Shot Execution:** Operates as a definitive script—it aggressively syncs the entire bucket in a single pass and exits cleanly upon completion, making it perfect for CI/CD pipelines or cron jobs.
-- **One-Way Sync:** Designed purely as a pusher mechanism. It only lists files in the local MinIO bucket and streams them to AWS S3, dramatically reducing AWS API costs since it never lists or checks the remote AWS bucket directly.
+- **Connection Pool Tuning:** HTTP connection limits are automatically scaled to match your parallelism setting, preventing hidden throttling from default connection caps.
+- **Progress Tracking:** Periodic progress summaries show how many files have been processed, synced, and skipped.
+- **One-Shot Execution:** Syncs the entire bucket in a single pass and exits cleanly, making it perfect for scripts, cron jobs, or CI/CD pipelines.
+- **One-Way Sync:** Only lists files in the local MinIO bucket and pushes them to AWS S3. It never lists or checks the remote AWS bucket, dramatically reducing AWS API costs.
 - **Graceful Shutdown:** Properly handles `Ctrl+C` cancellation instead of retrying cancelled operations.
 - **Skip SSL Validation:** Supports MinIO instances with self-signed certificates from private CAs via `--skip-ssl` (MinIO connection only; AWS remains fully validated).
 - **Log to File:** Optionally tee all output to a log file with `--log-file` for reviewing long-running syncs after the fact.
@@ -24,7 +25,7 @@ S3 Robust Sync is a highly resilient, high-performance command-line utility writ
 
 ## Installation
 
-You can build the source code directly:
+Build from source:
 
 ```bash
 git clone <repository-url>
@@ -32,22 +33,22 @@ cd s3-robust-sync
 dotnet build
 ```
 
-To create a standalone executable that you can run without the `dotnet` prefix:
+Create a standalone executable:
 
 ```bash
 # Example for macOS ARM64
 dotnet publish -c Release -r osx-arm64 --self-contained true -p:PublishSingleFile=true
 ```
 
-Alternatively, cross-platform single-file executables are automatically compiled and attached to GitHub Releases via GitHub Actions!
+Cross-platform binaries are also automatically compiled and attached to GitHub Releases via GitHub Actions.
 
 ## Usage
-
-S3 Robust Sync is built using the Cocona CLI framework. You can run it directly via `dotnet run` (make sure to use `--` before your arguments):
 
 ```bash
 dotnet run -- [options]
 ```
+
+> **Note:** When using `dotnet run`, use `--` to separate dotnet arguments from application arguments.
 
 ### Options
 
@@ -115,7 +116,7 @@ dotnet run -- \
 
 ## Startup Summary
 
-When the program starts, it prints a structured configuration summary so you can always verify what it's doing:
+When the program starts, it prints a structured configuration summary:
 
 ```
 ╔══════════════════════════════════════════════════╗
@@ -135,14 +136,183 @@ When the program starts, it prints a structured configuration summary so you can
 ╚══════════════════════════════════════════════════╝
 ```
 
-## How It Works
+## Architecture
 
-1. **Initialization**: Creates a local SQLite database (at `--db-path`, default `sync_state.db`) in the working directory to track state. It configures connection-pooling and WAL mode to handle massively concurrent I/O safely.
-2. **Scan**: Paginates through all files in the specified MinIO bucket (optionally filtering by `--prefix`). It automatically picks up from the cached pagination token if a previous run was aborted.
-3. **Filter**: Instantly skips any files that are already present in the SQLite database.
-4. **Transfer**: Streams the files directly from MinIO into AWS S3 using concurrent threads (dictated by `--parallelism`). Files over 100MB are first downloaded to a temporary file to ensure reliable multipart uploads for very large objects.
-5. **Mark & Save**: Once the file is successfully uploaded to AWS, the object key is recorded in the SQLite database, and the MinIO cursor (`ContinuationToken`) is checkpointed.
-6. **Progress**: Every 1,000 synced files or 10,000 processed files, a summary line is printed showing total progress.
-7. **Completion**: Once the entire bucket is scanned and uploaded, the process exits automatically.
+### High-Level Overview
 
-If any transfer or listing operation fails (e.g. lost internet connection), the built-in Polly retry policy catches the exception, logs an error, and waits before trying again on *that specific file or API call*. Retry delays use exponential backoff with random jitter (capping at ~65 seconds) to prevent thundering-herd problems when running with high parallelism. It will continue attempting indefinitely until it succeeds, completely eliminating the need for manual babysitting.
+```mermaid
+flowchart LR
+    subgraph Source
+        M["MinIO Bucket"]
+    end
+
+    subgraph S3RobustSync
+        P["Producer"]
+        CH["Channel"]
+        C1["Worker 1"]
+        C2["Worker 2"]
+        C3["Worker N"]
+        DB[("SQLite DB")]
+    end
+
+    subgraph Destination
+        AWS["AWS S3 Bucket"]
+    end
+
+    M -->|"ListObjectsV2\n(paginated)"| P
+    P -->|"S3Object"| CH
+    CH --> C1 & C2 & C3
+    C1 & C2 & C3 -->|"Check/Mark"| DB
+    C1 & C2 & C3 -->|"GetObject → PutObject"| AWS
+    P -->|"Save Token"| DB
+```
+
+### Producer-Consumer Pipeline
+
+The sync engine uses a **pipelined producer-consumer architecture** built on .NET's `Channel<T>` to maximize throughput. The listing and uploading happen concurrently, so upload workers are never idle waiting for the next MinIO API call.
+
+```mermaid
+sequenceDiagram
+    participant Producer
+    participant Channel
+    participant Worker1
+    participant Worker2
+    participant MinIO
+    participant AWS
+    participant SQLite
+
+    Producer->>MinIO: ListObjectsV2 (page 1)
+    MinIO-->>Producer: 1000 objects + token
+    Producer->>Channel: Write 1000 objects
+    Producer->>SQLite: Save continuation token
+
+    par Upload Workers
+        Worker1->>Channel: Read object
+        Worker1->>SQLite: IsFileSynced?
+        SQLite-->>Worker1: No
+        Worker1->>MinIO: GetObject
+        MinIO-->>Worker1: Stream
+        Worker1->>AWS: PutObject / Multipart
+        AWS-->>Worker1: OK
+        Worker1->>SQLite: MarkFileSynced
+    and
+        Worker2->>Channel: Read object
+        Worker2->>SQLite: IsFileSynced?
+        SQLite-->>Worker2: Yes (skip)
+    and Producer continues listing
+        Producer->>MinIO: ListObjectsV2 (page 2)
+        MinIO-->>Producer: 1000 objects + token
+        Producer->>Channel: Write 1000 objects
+        Producer->>SQLite: Save continuation token
+    end
+```
+
+Key behaviors:
+- The **producer** runs on its own task, continuously listing pages from MinIO and feeding objects into a bounded channel.
+- **N worker threads** (controlled by `--parallelism`) consume from the channel and upload concurrently.
+- If workers drain the channel faster than the producer lists, they **async-await** for more items (no spin-loop, no crash).
+- If the producer lists faster than workers upload, it **backpressure-blocks** once the channel buffer fills up.
+- The channel buffer holds `parallelism × 500` items, keeping the producer a few pages ahead without excessive memory use.
+
+### Retry & Resilience
+
+Every network operation is wrapped in an independent Polly retry policy that retries forever with exponential backoff and jitter:
+
+```mermaid
+flowchart TD
+    A["Network Operation"] --> B{"Success?"}
+    B -->|Yes| C["Continue"]
+    B -->|No| D["Log Error"]
+    D --> E["Wait: min(60s, 2^attempt) + jitter"]
+    E --> A
+
+    style A fill:#4a9eff,color:#fff
+    style C fill:#2ecc71,color:#fff
+    style D fill:#e74c3c,color:#fff
+```
+
+- **Listing retries** are isolated from **upload retries**. If one 40GB upload fails on retry #50, it doesn't affect the other 15 parallel uploads or the listing producer.
+- **Cancellation** (`Ctrl+C`) is excluded from the retry policy, so the program exits cleanly on interrupt.
+- **Jitter** (0–5 seconds of random delay) prevents thundering-herd problems when many parallel workers retry simultaneously after an outage.
+
+### Large File Handling
+
+Files are routed through one of two transfer paths based on size:
+
+```mermaid
+flowchart TD
+    A["File from MinIO"] --> B{"Size > 100 MB?"}
+    B -->|Yes| C["Download to\ntemporary file"]
+    C --> D["TransferUtility\nMultipart Upload\n(seekable file)"]
+    B -->|No| E["Direct stream\nMinIO → AWS"]
+    D --> F["Delete temp file"]
+    E --> G["Done"]
+    F --> G
+
+    style B fill:#f39c12,color:#fff
+    style C fill:#e74c3c,color:#fff
+    style E fill:#2ecc71,color:#fff
+```
+
+- **Small files (≤100MB):** Streamed directly from MinIO's response into the AWS upload request. Zero disk I/O, maximum speed.
+- **Large files (>100MB):** Downloaded to a temporary file first. This gives `TransferUtility` a seekable stream, enabling it to split the file into chunks for multipart upload and retry individual parts without re-downloading the entire file.
+- The temp file directory is configurable via `--temp-dir` (defaults to the system temp directory).
+
+### State Management
+
+```mermaid
+erDiagram
+    SyncedFiles {
+        TEXT ObjectKey PK "S3 object key"
+    }
+    SyncMetadata {
+        TEXT Key PK "e.g. 'ContinuationToken'"
+        TEXT Value "Token value"
+    }
+```
+
+- **`SyncedFiles`** — Every successfully uploaded object key is recorded here. On restart, files present in this table are skipped instantly.
+- **`SyncMetadata`** — Stores the MinIO pagination cursor (`ContinuationToken`). On restart, the listing resumes from this checkpoint instead of re-scanning from the beginning.
+- The database uses **WAL mode** for concurrent read/write safety and **connection pooling** for performance.
+
+### Connection Pool Tuning
+
+```mermaid
+flowchart LR
+    subgraph "S3 Robust Sync Process"
+        P["Producer\n(1 connection)"]
+        W1["Worker 1"]
+        W2["Worker 2"]
+        WN["Worker N"]
+    end
+
+    subgraph "MinIO"
+        MP["Connection Pool\nmax = parallelism + 4"]
+    end
+
+    subgraph "AWS S3"
+        AP["Connection Pool\nmax = parallelism + 4"]
+    end
+
+    P --> MP
+    W1 --> MP
+    W2 --> MP
+    WN --> MP
+    W1 --> AP
+    W2 --> AP
+    WN --> AP
+```
+
+HTTP connection pools are automatically sized to `parallelism + 4`, ensuring that all parallel workers plus the listing producer can hold open connections simultaneously without being throttled by the default .NET connection limit.
+
+## How It Works (Step by Step)
+
+1. **Startup**: Prints the configuration summary. Creates or opens the SQLite database. Optionally resumes from a saved continuation token.
+2. **Producer starts**: A background task begins paginating through the MinIO bucket, writing `S3Object` references into a bounded channel. After each page, it checkpoints the continuation token to the database.
+3. **Workers consume**: N parallel workers read from the channel. For each object:
+   - Check the SQLite database — skip if already synced.
+   - Download from MinIO and upload to AWS (direct stream for small files, temp file for large files).
+   - Record the object key in SQLite on success.
+4. **Retries**: Any network failure on any operation triggers infinite retries with exponential backoff + jitter. Other workers and the producer are unaffected.
+5. **Completion**: Once the producer has listed every object and the workers have drained the channel, the program prints a final progress summary and exits with code 0.
+6. **Crash recovery**: On restart, the program loads the continuation token from SQLite and resumes listing from that point. Any objects from the last partially-processed page are checked against the `SyncedFiles` table and skipped if already uploaded.
