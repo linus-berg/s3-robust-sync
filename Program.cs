@@ -61,6 +61,7 @@ class Program
                 ServiceURL = minioUrl,
                 ForcePathStyle = true,
                 HttpClientFactory = new ConfigurableHttpClientFactory(maxConnections, skipSsl),
+                Timeout = TimeSpan.FromMinutes(15),
             };
 
             if (skipSsl)
@@ -74,6 +75,7 @@ class Program
             {
                 RegionEndpoint = RegionEndpoint.GetBySystemName(awsRegion),
                 HttpClientFactory = new ConfigurableHttpClientFactory(maxConnections),
+                Timeout = TimeSpan.FromMinutes(15),
             };
             using var awsClient = new AmazonS3Client(awsAccessKey, awsSecretKey, awsConfig);
 
