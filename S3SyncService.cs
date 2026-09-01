@@ -49,8 +49,12 @@ public class S3SyncService
         _tempDir = tempDir;
         _parallelism = parallelism;
 
+        // Retry ALL exceptions. Cancellation is handled by passing a CancellationToken
+        // to ExecuteAsync — Polly checks it between retries and stops if cancelled.
+        // This ensures SDK-internal TaskCanceledException (HTTP timeouts, multipart
+        // abort) are retried, while user Ctrl+C still exits cleanly.
         _retryPolicy = Policy
-            .Handle<Exception>(ex => ex is not OperationCanceledException)
+            .Handle<Exception>()
             .WaitAndRetryForeverAsync(
                 sleepDurationProvider: retryAttempt =>
                     TimeSpan.FromSeconds(Math.Min(60, Math.Pow(2, retryAttempt)) + Random.Shared.NextDouble() * 5),
@@ -77,6 +81,8 @@ public class S3SyncService
         try
         {
             // Producer: continuously pages through MinIO and feeds objects into the channel.
+            // Uses CancellationToken.None so that SDK timeouts (TaskCanceledException)
+            // are always retried — the producer has no user-cancellation path.
             var producerTask = Task.Run(async () =>
             {
                 string? continuationToken = null;
@@ -84,7 +90,7 @@ public class S3SyncService
                 {
                     do
                     {
-                        ListObjectsV2Response listResponse = await _retryPolicy.ExecuteAsync(async () =>
+                        ListObjectsV2Response listResponse = await _retryPolicy.ExecuteAsync(async (ct) =>
                         {
                             var listRequest = new ListObjectsV2Request
                             {
@@ -93,8 +99,8 @@ public class S3SyncService
                                 Prefix = _prefix
                             };
 
-                            return await _minioClient.ListObjectsV2Async(listRequest);
-                        });
+                            return await _minioClient.ListObjectsV2Async(listRequest, ct);
+                        }, CancellationToken.None);
 
                         foreach (var s3Object in listResponse.S3Objects)
                         {
@@ -133,29 +139,21 @@ public class S3SyncService
 
                 Console.WriteLine($"[{DateTime.UtcNow:O}] Syncing: {s3Object.Key} ({FormatSize(s3Object.Size.GetValueOrDefault())})");
 
-                await _retryPolicy.ExecuteAsync(async () =>
+                // Pass the cancellationToken to Polly. Between retries, Polly checks
+                // if the token is cancelled (user Ctrl+C) and stops. If the token is
+                // NOT cancelled but the SDK throws TaskCanceledException (timeout),
+                // Polly retries normally.
+                await _retryPolicy.ExecuteAsync(async (ct) =>
                 {
-                    try
+                    if (s3Object.Size.GetValueOrDefault() > LargeFileThreshold)
                     {
-                        if (s3Object.Size.GetValueOrDefault() > LargeFileThreshold)
-                        {
-                            await TransferViaTemporaryFile(s3Object, transferUtility, cancellationToken);
-                        }
-                        else
-                        {
-                            await TransferViaStream(s3Object, transferUtility, cancellationToken);
-                        }
+                        await TransferViaTemporaryFile(s3Object, transferUtility, ct);
                     }
-                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                    else
                     {
-                        // The AWS SDK internally cancelled the operation (e.g. TransferUtility
-                        // aborting remaining multipart upload parts after one part failed due
-                        // to a network error). This is NOT a user cancellation (Ctrl+C), so
-                        // wrap it in a retryable exception instead of letting the retry policy
-                        // treat it as a deliberate cancellation.
-                        throw new IOException("Transfer was internally cancelled by the AWS SDK due to a transient error. Retrying...");
+                        await TransferViaStream(s3Object, transferUtility, ct);
                     }
-                });
+                }, cancellationToken);
 
                 _repository.MarkFileSynced(s3Object.Key);
                 long synced = Interlocked.Increment(ref _totalSynced);
