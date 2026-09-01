@@ -135,13 +135,25 @@ public class S3SyncService
 
                 await _retryPolicy.ExecuteAsync(async () =>
                 {
-                    if (s3Object.Size.GetValueOrDefault() > LargeFileThreshold)
+                    try
                     {
-                        await TransferViaTemporaryFile(s3Object, transferUtility, cancellationToken);
+                        if (s3Object.Size.GetValueOrDefault() > LargeFileThreshold)
+                        {
+                            await TransferViaTemporaryFile(s3Object, transferUtility, cancellationToken);
+                        }
+                        else
+                        {
+                            await TransferViaStream(s3Object, transferUtility, cancellationToken);
+                        }
                     }
-                    else
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
                     {
-                        await TransferViaStream(s3Object, transferUtility, cancellationToken);
+                        // The AWS SDK internally cancelled the operation (e.g. TransferUtility
+                        // aborting remaining multipart upload parts after one part failed due
+                        // to a network error). This is NOT a user cancellation (Ctrl+C), so
+                        // wrap it in a retryable exception instead of letting the retry policy
+                        // treat it as a deliberate cancellation.
+                        throw new IOException("Transfer was internally cancelled by the AWS SDK due to a transient error. Retrying...");
                     }
                 });
 
